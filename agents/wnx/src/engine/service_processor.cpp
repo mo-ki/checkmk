@@ -665,6 +665,22 @@ void OpenFirewall(bool controller) {
     }
 }
 
+world::ExternalPort::IoParam AsIoParam(
+    const std::optional<srv::ServiceProcessor::ControllerParam> &cp) {
+    auto port = cp.has_value() ? cp->port
+                               : cfg::GetVal(cfg::groups::kGlobal,
+                                             cfg::vars::kPort, cfg::kMainPort);
+    return {
+        .port = port,
+        .local_only = cp.has_value() && ac::GetConfiguredLocalOnly()
+                          ? world::LocalOnly::yes
+                          : world::LocalOnly::no,
+        .pid = cp.has_value() && (ac::GetConfiguredCheck() || port == 0U)
+                   ? cp->pid
+                   : std::optional<uint32_t>{},
+    };
+}
+
 }  // namespace
 
 /// \brief <HOSTING THREAD>
@@ -691,8 +707,8 @@ void ServiceProcessor::mainThread(world::ExternalPort *ex_port,
                 ac::kCmkAgentUnistall,
             controller_params.has_value());
     }
-    MailSlot mailbox(is_service ? cfg::kServiceMailSlot : cfg::kTestingMailSlot,
-                     0);
+    mailslot::Slot mailbox(
+        is_service ? cfg::kServiceMailSlot : cfg::kTestingMailSlot, 0);
     internal_port_ = carrier::BuildPortName(carrier::kCarrierMailslotName,
                                             mailbox.GetName());
     try {
@@ -720,15 +736,11 @@ void ServiceProcessor::mainThread(world::ExternalPort *ex_port,
 
         // Main Processing Loop
         while (true) {
-            const uint16_t use_port =
-                controller_params
-                    ? controller_params->port
-                    : cfg::GetVal(cfg::groups::kGlobal, cfg::vars::kPort,
-                                  cfg::kMainPort);
             rt_device.start();
+            const auto io_param = AsIoParam(controller_params);
+            XLOG::l.i("Starting io with {} {}", io_param.port, io_param.pid);
             auto io_started = ex_port->startIo(
-                [this, &rt_device,
-                 use_port](const std::string &ip_addr) -> std::vector<uint8_t> {
+                [this, &rt_device](const std::string &ip_addr) {
                     //
                     // most important entry point for external port io
                     // this is internal implementation of the io_context
@@ -739,13 +751,7 @@ void ServiceProcessor::mainThread(world::ExternalPort *ex_port,
                               answer_.getId().time_since_epoch().count());
                     return generateAnswer(ip_addr);
                 },
-                use_port,
-                controller_params.has_value() && ac::GetConfiguredLocalOnly()
-                    ? world::LocalOnly::yes
-                    : world::LocalOnly::no,
-                controller_params.has_value() && ac::GetConfiguredCheck()
-                    ? controller_params->pid
-                    : std::optional<uint32_t>{});
+                io_param);
             ON_OUT_OF_SCOPE({
                 ex_port->shutdownIo();
                 rt_device.stop();
@@ -771,7 +777,7 @@ void ServiceProcessor::mainThread(world::ExternalPort *ex_port,
         XLOG::l.bp("Not expected exception. Fix it!");
     }
     internal_port_ = "";
-}
+}  // namespace cma::srv
 
 void ServiceProcessor::startTestingMainThread() {
     if (thread_.joinable()) {
@@ -786,7 +792,7 @@ void ServiceProcessor::startTestingMainThread() {
 // Implementation of the Windows signals
 // ---------------- END ----------------
 
-bool SystemMailboxCallback(const MailSlot * /*nothing*/, const void *data,
+bool SystemMailboxCallback(const mailslot::Slot * /*nothing*/, const void *data,
                            int len, void *context) {
     auto *processor = static_cast<srv::ServiceProcessor *>(context);
     if (processor == nullptr) {

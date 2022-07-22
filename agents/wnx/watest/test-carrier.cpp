@@ -14,10 +14,21 @@
 #include "tools/_misc.h"
 
 using namespace std::chrono_literals;
+using namespace std::string_literals;
 
 namespace cma::carrier {
 
-TEST(CarrierTest, NoMaiSlotTracing) { EXPECT_FALSE(IsMailApiTraced()); }
+TEST(CarrierTest, NoMaiSlotTracing) { EXPECT_FALSE(mailslot::IsApiLogged()); }
+
+TEST(CarrierTest, DataHeaderConversion) {
+    EXPECT_EQ(AsString(nullptr), ""s);
+    EXPECT_EQ(AsDataBlock(nullptr), std::vector<unsigned char>{});
+    const std::vector<unsigned char> buf{'a', 'b', 'c', 'd', 'e'};
+    auto c1 =
+        CarrierDataHeader::createPtr("1", 1, DataType::kLog, buf.data(), 5U);
+    EXPECT_EQ(AsString(c1.get()), "abcde"s);
+    EXPECT_EQ(AsDataBlock(c1.get()), buf);
+}
 
 class CarrierTestFixture : public ::testing::Test {
 protected:
@@ -30,8 +41,9 @@ protected:
 
     static inline TestStorage g_mailslot_storage;
 
-    static bool MailboxCallbackCarrier(const MailSlot *Slot, const void *Data,
-                                       int Len, void *Context) {
+    static bool MailboxCallbackCarrier(const mailslot::Slot *Slot,
+                                       const void *Data, int Len,
+                                       void *Context) {
         using namespace std::chrono;
         auto storage = (TestStorage *)Context;
         if (!storage) {
@@ -79,7 +91,7 @@ protected:
     void TearDown() override {
         mailbox_.DismantleThread();  //
     }
-    MailSlot mailbox_{"WinAgentTest", 0};
+    mailslot::Slot mailbox_{"WinAgentTest", 0};
     std::string internal_port_;
     CoreCarrier cc_;
 };
@@ -182,10 +194,10 @@ public:
         mailbox_server.DismantleThread();
     }
     const char *name_used{"WinAgentTestLocal"};
-    MailSlot mailbox_client{name_used, 0};
+    mailslot::Slot mailbox_client{name_used, 0};
 
 private:
-    MailSlot mailbox_server{name_used, 0};
+    mailslot::Slot mailbox_server{name_used, 0};
 
     std::string internal_port{BuildPortName(
         kCarrierMailslotName, mailbox_server.GetName())};  // port here

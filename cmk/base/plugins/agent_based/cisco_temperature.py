@@ -3,10 +3,34 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
-# NOTE: Careful when replacing the *-import below with a more specific import. This can cause
-# problems because it might remove variables needed for accessing discovery rulesets.
-from cmk.base.check_legacy_includes.cisco_sensor_item import *  # pylint: disable=wildcard-import,unused-wildcard-import
-from cmk.base.check_legacy_includes.temperature import *  # pylint: disable=wildcard-import,unused-wildcard-import
+from typing import Any, List, Mapping, Union
+
+from cmk.base.plugins.agent_based.agent_based_api.v1 import (
+    all_of,
+    any_of,
+    check_levels,
+    contains,
+    exists,
+    get_value_store,
+    OIDCached,
+    OIDEnd,
+    register,
+    Result,
+    Service,
+    SNMPTree,
+    State,
+)
+from cmk.base.plugins.agent_based.agent_based_api.v1.type_defs import (
+    CheckResult,
+    DiscoveryResult,
+    StringTable,
+)
+from cmk.base.plugins.agent_based.utils.cisco_sensor_item import cisco_sensor_item
+from cmk.base.plugins.agent_based.utils.temperature import check_temperature, TempParamDict
+
+Section = Mapping[str, Mapping[str, Mapping[str, Any]]]  # oh boy.
+
+_Levels = Union[None, tuple[float, float, float, float], tuple[float, float]]
 
 # NOTE: Devices of type 3850 with firmware versions 3.2.0SE, 3.2.1, 3.2.2
 # have been observed to display a tenth of the actual temperature value.
@@ -20,14 +44,16 @@ from cmk.base.check_legacy_includes.temperature import *  # pylint: disable=wild
 #
 
 # OID: ifAdminStatus
-cisco_temperature_admin_state_map = {
+_CISCO_TEMPERATURE_ADMIN_STATE_MAP = {
     "1": "up",
     "2": "down",
     "3": "testing",
 }
 
 
-def parse_cisco_temperature(info):  # pylint: disable=too-many-branches
+def parse_cisco_temperature(  # pylint: disable=too-many-branches
+    string_table: List[StringTable],
+) -> Section:
     # CISCO-ENTITY-SENSOR-MIB entSensorType
     cisco_sensor_types = {
         "1": "other",
@@ -48,23 +74,23 @@ def parse_cisco_temperature(info):  # pylint: disable=too-many-branches
 
     # CISCO-ENTITY-SENSOR-MIB::entSensorScale
     cisco_entity_exponents = {
-        "1": -24,  #     1:yocto
-        "2": -21,  #     2:zepto
-        "3": -18,  #     3:atto
-        "4": -15,  #     4:femto
-        "5": -12,  #     5:pico
-        "6": -9,  #     6:nano
-        "7": -6,  #     7:micro
-        "8": -3,  #     8:milli
-        "9": 0,  #     9:units
-        "10": 3,  #     10:kilo
-        "11": 6,  #     11:mega
-        "12": 9,  #     12:giga
-        "13": 12,  #     13:tera
-        "14": 18,  #     14:exa
-        "15": 15,  #     15:peta
-        "16": 21,  #     16:zetta
-        "17": 24,  #     17:yotta
+        "1": -24,  # yocto
+        "2": -21,  # zepto
+        "3": -18,  # atto
+        "4": -15,  # femto
+        "5": -12,  # pico
+        "6": -9,  # nano
+        "7": -6,  # micro
+        "8": -3,  # milli
+        "9": 0,  # units
+        "10": 3,  # kilo
+        "11": 6,  # mega
+        "12": 9,  # giga
+        "13": 12,  # tera
+        "14": 18,  # exa
+        "15": 15,  # peta
+        "16": 21,  # zetta
+        "17": 24,  # yotta
     }
 
     # CISCO-ENTITY-SENSOR-MIB::entSensorStatus
@@ -110,7 +136,7 @@ def parse_cisco_temperature(info):  # pylint: disable=too-many-branches
     #              [u'2008', u'SW#2, Sensor#1, GREEN', u'37', u'68', u'1'],
     #              ...]
 
-    description_info, state_info, levels_info, perfstuff, admin_states = info
+    description_info, state_info, levels_info, perfstuff, admin_states = string_table
 
     # Create dict of sensor descriptions
     descriptions = dict(description_info)
@@ -125,10 +151,10 @@ def parse_cisco_temperature(info):  # pylint: disable=too-many-branches
     for if_name, admin_state in admin_states:
         for sensor_id, descr in descriptions.items():
             if descr.startswith(if_name):
-                admin_states_dict[sensor_id] = cisco_temperature_admin_state_map.get(admin_state)
+                admin_states_dict[sensor_id] = _CISCO_TEMPERATURE_ADMIN_STATE_MAP.get(admin_state)
 
     # Create dict with thresholds
-    thresholds = {}
+    thresholds: dict[str, list[str]] = {}
     for sensor_id, sensortype_id, scalecode, magnitude, value, sensorstate in state_info:
         thresholds.setdefault(sensor_id, [])
 
@@ -138,7 +164,7 @@ def parse_cisco_temperature(info):  # pylint: disable=too-many-branches
         thresholds.setdefault(sensor_id, []).append(level)
 
     # Parse OIDs described by CISCO-ENTITY-SENSOR-MIB
-    entity_parsed = {}
+    entity_parsed: dict[str, dict[str, dict[str, str]]] = {}
     for sensor_id, sensortype_id, scalecode, magnitude, value, sensorstate in state_info:
         sensortype = cisco_sensor_types.get(sensortype_id)
         if sensortype not in ("dBm", "celsius"):
@@ -154,7 +180,7 @@ def parse_cisco_temperature(info):  # pylint: disable=too-many-branches
 
         entity_parsed.setdefault(sensortype_id, {})
 
-        sensor_attrs = {
+        sensor_attrs: dict[str, Any] = {
             "descr": descr,
             "raw_dev_state": sensorstate,  # used in discovery function
             "dev_state": map_states.get(sensorstate, (3, "unknown[%s]" % sensorstate)),
@@ -184,7 +210,12 @@ def parse_cisco_temperature(info):  # pylint: disable=too-many-branches
                     sorted_thresholds[0],
                     sorted_thresholds[1],
                 )
-                dev_levels = (opt_warn_upper, opt_crit_upper, opt_warn_lower, opt_crit_lower)
+                dev_levels: _Levels = (
+                    opt_warn_upper,
+                    opt_crit_upper,
+                    opt_warn_lower,
+                    opt_crit_lower,
+                )
             elif sensortype == "celsius" and len(thresholds[sensor_id]) == 4:
                 temp_crit_upper_raw, temp_warn_upper_raw = thresholds[sensor_id][0:2]
                 # Some devices deliver these values in the wrong order. In case the devices
@@ -200,7 +231,7 @@ def parse_cisco_temperature(info):  # pylint: disable=too-many-branches
             entity_parsed[sensortype_id].setdefault(sensor_id, sensor_attrs)
 
     found_temp_sensors = entity_parsed.get("8", {})
-    parsed = {}
+    parsed: dict[str, dict[str, dict[str, Any]]] = {}
     temp_sensors = parsed.setdefault("8", {})
     for sensor_id, statustext, temp, max_temp, state in perfstuff:
         if sensor_id in descriptions and sensor_id in found_temp_sensors:
@@ -214,7 +245,7 @@ def parse_cisco_temperature(info):  # pylint: disable=too-many-branches
         else:
             item = cisco_sensor_item(statustext, sensor_id)
 
-        temp_sensor_attrs = {
+        temp_sensor_attrs: dict[str, Any] = {
             "raw_dev_state": state,
             "dev_state": map_envmon_states.get(state, (3, "unknown[%s]" % state)),
         }
@@ -238,6 +269,67 @@ def parse_cisco_temperature(info):  # pylint: disable=too-many-branches
     return parsed
 
 
+register.snmp_section(
+    name="cisco_temperature",
+    parse_function=parse_cisco_temperature,
+    detect=all_of(
+        contains(".1.3.6.1.2.1.1.1.0", "cisco"),
+        any_of(
+            exists(".1.3.6.1.4.1.9.9.91.1.1.1.1.*"),
+            exists(".1.3.6.1.4.1.9.9.13.1.3.1.3.*"),
+        ),
+    ),
+    fetch=[
+        # cisco_temp_sensor data
+        SNMPTree(
+            base=".1.3.6.1.2.1.47.1.1.1.1",
+            oids=[
+                OIDEnd(),
+                OIDCached("7"),  # Name of the sensor
+            ],
+        ),
+        # Type and current state
+        SNMPTree(
+            base=".1.3.6.1.4.1.9.9.91.1.1.1.1",
+            oids=[
+                OIDEnd(),
+                "1",  # CISCO-ENTITY-SENSOR-MIB::entSensorType
+                "2",  # CISCO-ENTITY-SENSOR-MIB::entSensorScale
+                "3",  # CISCO-ENTITY-SENSOR-MIB::entSensorPrecision
+                "4",  # CISCO-ENTITY-SENSOR-MIB::entSensorValue
+                "5",  # CISCO-ENTITY-SENSOR-MIB::entSensorStatus
+            ],
+        ),
+        # Threshold
+        SNMPTree(
+            base=".1.3.6.1.4.1.9.9.91.1.2.1.1",
+            oids=[
+                OIDEnd(),
+                "4",  # Thresholds
+            ],
+        ),
+        # cisco_temp_perf data
+        SNMPTree(
+            base=".1.3.6.1.4.1.9.9.13.1.3.1",
+            oids=[  # CISCO-SMI
+                OIDEnd(),
+                "2",  # ciscoEnvMonTemperatureStatusDescr
+                "3",  # ciscoEnvMonTemperatureStatusValue
+                "4",  # ciscoEnvMonTemperatureThreshold
+                "6",  # ciscoEnvMonTemperatureState
+            ],
+        ),
+        SNMPTree(
+            base=".1.3.6.1.2.1.2.2.1",
+            oids=[
+                OIDCached("2"),  # Description of the sensor
+                OIDCached("7"),  # ifAdminStatus
+            ],
+        ),
+    ],
+)
+
+
 #   .--temperature---------------------------------------------------------.
 #   |      _                                      _                        |
 #   |     | |_ ___ _ __ ___  _ __   ___ _ __ __ _| |_ _   _ _ __ ___       |
@@ -250,95 +342,47 @@ def parse_cisco_temperature(info):  # pylint: disable=too-many-branches
 #   '----------------------------------------------------------------------'
 
 
-def inventory_cisco_temperature(parsed):
-    for item, value in parsed.get("8", {}).items():
+def discover_cisco_temperature(section: Section) -> DiscoveryResult:
+    for item, value in section.get("8", {}).items():
         if not value.get("obsolete", False):
-            yield item, {}
+            yield Service(item=item)
 
 
-def check_cisco_temperature(item, params, parsed):
-    temp_parsed = parsed.get("8", {})
-    if item in temp_parsed:
-        data = temp_parsed[item]
-        if data.get("obsolete", False):
-            return 3, "This sensor is obsolete, please rediscover"
+def check_cisco_temperature(item: str, params: TempParamDict, section: Section) -> CheckResult:
+    temp_parsed = section.get("8", {})
+    if item not in temp_parsed:
+        return
 
-        state, state_readable = data["dev_state"]
-        reading = data.get("reading")
-        if reading is None:
-            return state, "Status: %s" % state_readable
-        return check_temperature(
-            reading,
-            params,
-            "cisco_temperature_%s" % item,
-            dev_levels=data["dev_levels"],
-            dev_status=state,
-            dev_status_name=state_readable,
-        )
-    return None
+    data = temp_parsed[item]
+    if data.get("obsolete", False):
+        yield Result(state=State.UNKNOWN, summary="This sensor is obsolete, please rediscover")
+        return
+
+    state, state_readable = data["dev_state"]
+    reading = data.get("reading")
+    if reading is None:
+        yield Result(state=State(state), summary="Status: %s" % state_readable)
+        return
+
+    yield from check_temperature(
+        reading,
+        params,
+        unique_name="cisco_temperature_%s" % item,
+        value_store=get_value_store(),
+        dev_levels=data["dev_levels"],
+        dev_status=state,
+        dev_status_name=state_readable,
+    )
 
 
-check_info["cisco_temperature"] = {
-    "parse_function": parse_cisco_temperature,
-    "inventory_function": inventory_cisco_temperature,
-    "check_function": check_cisco_temperature,
-    "service_description": "Temperature %s",
-    "group": "temperature",
-    "has_perfdata": True,
-    "snmp_scan_function": lambda oid: "cisco" in oid(".1.3.6.1.2.1.1.1.0").lower()
-    and (
-        oid(".1.3.6.1.4.1.9.9.91.1.1.1.1.*") is not None
-        or oid(".1.3.6.1.4.1.9.9.13.1.3.1.3.*") is not None
-    ),
-    "snmp_info": [
-        # cisco_temp_sensor data
-        (
-            ".1.3.6.1.2.1.47.1.1.1.1",
-            [
-                OID_END,
-                CACHED_OID(7),  # Name of the sensor
-            ],
-        ),
-        # Type and current state
-        (
-            ".1.3.6.1.4.1.9.9.91.1.1.1.1",
-            [
-                OID_END,
-                1,  # CISCO-ENTITY-SENSOR-MIB::entSensorType
-                2,  # CISCO-ENTITY-SENSOR-MIB::entSensorScale
-                3,  # CISCO-ENTITY-SENSOR-MIB::entSensorPrecision
-                4,  # CISCO-ENTITY-SENSOR-MIB::entSensorValue
-                5,  # CISCO-ENTITY-SENSOR-MIB::entSensorStatus
-            ],
-        ),
-        # Threshold
-        (
-            ".1.3.6.1.4.1.9.9.91.1.2.1.1",
-            [
-                OID_END,
-                4,  # Thresholds
-            ],
-        ),
-        # cisco_temp_perf data
-        (
-            ".1.3.6.1.4.1.9.9.13.1.3.1",
-            [  # CISCO-SMI
-                OID_END,
-                2,  # ciscoEnvMonTemperatureStatusDescr
-                3,  # ciscoEnvMonTemperatureStatusValue
-                4,  # ciscoEnvMonTemperatureThreshold
-                6,  # ciscoEnvMonTemperatureState
-            ],
-        ),
-        (
-            ".1.3.6.1.2.1.2.2.1",
-            [
-                CACHED_OID(2),  # Description of the sensor
-                CACHED_OID(7),  # ifAdminStatus
-            ],
-        ),
-    ],
-}
+register.check_plugin(
+    name="cisco_temperature",
+    service_name="Temperature %s",
+    discovery_function=discover_cisco_temperature,
+    check_function=check_cisco_temperature,
+    check_ruleset_name="temperature",
+    check_default_parameters={},  # is this OK?
+)
 
 # .
 #   .--dom-----------------------------------------------------------------.
@@ -352,51 +396,49 @@ check_info["cisco_temperature"] = {
 #   | digital optical monitoring                                           |
 #   '----------------------------------------------------------------------'
 
-discovery_cisco_dom_rules = []
 
-
-def inventory_cisco_temperature_dom(parsed):
-    discovery_options = host_extra_conf_merged(host_name(), discovery_cisco_dom_rules)
-    parsed_dom = parsed.get("14", {})
+def discover_cisco_temperature_dom(params: Mapping[str, Any], section: Section) -> DiscoveryResult:
+    parsed_dom = section.get("14", {})
     admin_states_to_discover = {
-        cisco_temperature_admin_state_map[admin_state]
-        for admin_state in discovery_options.get("admin_states", ["1"])
+        _CISCO_TEMPERATURE_ADMIN_STATE_MAP[admin_state]
+        for admin_state in params.get("admin_states", ["1"])
     } | {None}
     for item, attrs in parsed_dom.items():
         dev_state = attrs.get("raw_dev_state")
         adm_state = attrs.get("admin_state")
         if dev_state == "1" and adm_state in admin_states_to_discover:
-            yield item, {}
+            yield Service(item=item)
 
 
-def _determine_levels(user_levels, device_levels):
+def _determine_levels(
+    user_levels: tuple[float, float] | bool,
+    device_levels: tuple[float, float] | tuple[None, None],
+) -> tuple[float, float] | None:
     if isinstance(user_levels, tuple):
         return user_levels
-    elif user_levels:
+    if user_levels:
+        if device_levels[0] is None or device_levels[1] is None:
+            return None
         return device_levels
-    return (None, None)
+    return None
 
 
-def check_cisco_temperature_dom(item, params, parsed):
+def check_cisco_temperature_dom(
+    item: str, params: Mapping[str, Any], section: Section
+) -> CheckResult:
     # TODO perf, precision, severity, etc.
 
-    data = parsed.get("14", {}).get(item, {})
+    data = section.get("14", {}).get(item, {})
     reading = data.get("reading")
     if reading is None:
         return
 
     # TODO: care about check status which is always OK
     state, state_readable = data["dev_state"]
-    yield state, "Status: %s" % state_readable
+    yield Result(state=State(state), summary="Status: %s" % state_readable)
 
     # get won't save you, because 'dev_levels' may be present, but None.
     device_levels = data.get("dev_levels") or (None, None, None, None)
-
-    # Map WATO configuration of levels to check_levels() compatible tuple.
-    # Default value in case of missing WATO config is use device levels.
-    levels = _determine_levels(
-        params.get("power_levels_upper", True), device_levels[0:2]
-    ) + _determine_levels(params.get("power_levels_lower", True), device_levels[2:4])
 
     if "Transmit" in data["descr"]:
         dsname = "output_signal_power_dbm"
@@ -406,13 +448,26 @@ def check_cisco_temperature_dom(item, params, parsed):
         # in rare case of sensor id instead of sensor description no destinction
         # between transmit/receive possible
         dsname = "signal_power_dbm"
-    yield check_levels(reading, dsname, levels, unit="dBm", infoname="Signal power")
+    yield from check_levels(
+        reading,
+        metric_name=dsname,
+        # Map WATO configuration of levels to check_levels() compatible tuple.
+        # Default value in case of missing WATO config is use device levels.
+        levels_lower=_determine_levels(params.get("power_levels_lower", True), device_levels[2:4]),
+        levels_upper=_determine_levels(params.get("power_levels_upper", True), device_levels[0:2]),
+        render_func=lambda f: "%.2f dBm" % f,
+        label="Signal power",
+    )
 
 
-check_info["cisco_temperature.dom"] = {
-    "inventory_function": inventory_cisco_temperature_dom,
-    "check_function": check_cisco_temperature_dom,
-    "service_description": "DOM %s",
-    "group": "cisco_dom",
-    "has_perfdata": True,
-}
+register.check_plugin(
+    name="cisco_temperature_dom",
+    service_name="DOM %s",
+    sections=["cisco_temperature"],
+    discovery_function=discover_cisco_temperature_dom,
+    discovery_default_parameters={"admin_states": ["1"]},
+    discovery_ruleset_name="discovery_cisco_dom_rules",
+    check_function=check_cisco_temperature_dom,
+    check_ruleset_name="cisco_dom",
+    check_default_parameters={},
+)

@@ -6,6 +6,7 @@
 
 from collections import defaultdict
 from contextlib import suppress
+from functools import partial
 from typing import (
     Container,
     DefaultDict,
@@ -108,17 +109,23 @@ def active_check_checking(
         - `cmk.base.discovery.active_check_discovery()` for the discovery.
 
     """
-    return _execute_checkmk_checks_with_error_handling(
-        hostname=hostname,
-        fetched=fetched,
-        run_plugin_names=run_plugin_names,
-        selected_sections=selected_sections,
-        dry_run=dry_run,
-        show_perfdata=show_perfdata,
+    host_config = HostConfig.make_host_config(hostname)
+    return error_handling.check_result(
+        partial(
+            _execute_checkmk_checks,
+            hostname=hostname,
+            fetched=fetched,
+            run_plugin_names=run_plugin_names,
+            selected_sections=selected_sections,
+            dry_run=dry_run,
+            show_perfdata=show_perfdata,
+        ),
+        host_config=host_config,
+        service_name="Check_MK",
+        plugin_name="mk",
     )
 
 
-# TODO: see if we can/should drop the decorator. If so, make hostname a kwarg-only
 def commandline_checking(
     host_name: HostName,
     ipaddress: Optional[HostAddress],
@@ -128,6 +135,33 @@ def commandline_checking(
     dry_run: bool = False,
     show_perfdata: bool = False,
 ) -> ServiceState:
+    # The error handling is required for the Nagios core.
+    host_config = HostConfig.make_host_config(host_name)
+    return error_handling.check_result(
+        partial(
+            _commandline_checking,
+            host_name,
+            ipaddress,
+            run_plugin_names=run_plugin_names,
+            selected_sections=selected_sections,
+            dry_run=dry_run,
+            show_perfdata=show_perfdata,
+        ),
+        host_config=host_config,
+        service_name="Check_MK",
+        plugin_name="mk",
+    )
+
+
+def _commandline_checking(
+    host_name: HostName,
+    ipaddress: Optional[HostAddress],
+    *,
+    run_plugin_names: Container[CheckPluginName] = EVERYTHING,
+    selected_sections: SectionNameCollection = NO_SELECTION,
+    dry_run: bool = False,
+    show_perfdata: bool = False,
+) -> ActiveCheckResult:
     console.vverbose("Checkmk version %s\n", cmk_version.__version__)
     config_cache = config.get_config_cache()
     host_config = config_cache.get_host_config(host_name)
@@ -157,7 +191,7 @@ def commandline_checking(
         file_cache_max_age=host_config.max_cachefile_age,
         mode=Mode.CHECKING if selected_sections is NO_SELECTION else Mode.FORCE_SECTIONS,
     )
-    return _execute_checkmk_checks_with_error_handling(
+    return _execute_checkmk_checks(
         hostname=host_name,
         fetched=fetched,
         run_plugin_names=run_plugin_names,
@@ -165,39 +199,6 @@ def commandline_checking(
         dry_run=dry_run,
         show_perfdata=show_perfdata,
     )
-
-
-def _execute_checkmk_checks_with_error_handling(
-    *,
-    hostname: HostName,
-    fetched: Sequence[Tuple[Source, FetcherMessage]],
-    run_plugin_names: Container[CheckPluginName],
-    selected_sections: SectionNameCollection,
-    dry_run: bool,
-    show_perfdata: bool,
-) -> ServiceState:
-    host_config = HostConfig.make_host_config(hostname)
-    try:
-        state, text = error_handling.handle_success(
-            _execute_checkmk_checks(
-                hostname=hostname,
-                fetched=fetched,
-                run_plugin_names=run_plugin_names,
-                selected_sections=selected_sections,
-                dry_run=dry_run,
-                show_perfdata=show_perfdata,
-            )
-        )
-    except Exception as exc:
-        state, text = error_handling.handle_failure(
-            exc,
-            host_config.exit_code_spec(),
-            host_config=host_config,
-            service_name="Check_MK",
-            plugin_name="mk",
-        )
-    error_handling.handle_output(text, hostname)
-    return state
 
 
 def _execute_checkmk_checks(

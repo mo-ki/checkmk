@@ -324,7 +324,6 @@ def load(
     # Such validation only makes sense when all checks have been loaded
     if all_checks_loaded():
         _validate_configuraton_variables(vars_before_config)
-        _verify_no_deprecated_check_rulesets()
 
     _verify_no_deprecated_variables_used()
 
@@ -570,6 +569,7 @@ def _collect_parameter_rulesets_from_globals(global_dict: Dict[str, Any]) -> Non
     # list of discovery ruleset names which are used in migrated AND in legacy code; can be removed
     # once we have no such cases any more
     partially_migrated = {
+        "brocade_fcport_inventory",
         "diskstat_inventory",
         "filesystem_groups",
     }
@@ -676,20 +676,6 @@ def _verify_no_deprecated_variables_used() -> None:
             'Please use "static_checks" instead (which is configurable via "Enforced services" in Setup).\n'
         )
         sys.exit(1)
-
-
-def _verify_no_deprecated_check_rulesets() -> None:
-    # this used to do something until the migration of logwatch.
-    # TODO: decide wether we might still need this.
-    deprecated_rulesets: List[Tuple[str, str]] = []
-    for check_plugin_name, varname in deprecated_rulesets:
-        check_context = get_check_context(check_plugin_name)
-        if check_context.get(varname):
-            console.warning(
-                "Found rules for deprecated ruleset %r. These rules are not applied "
-                "anymore. In case you still need them, you need to migrate them by hand. "
-                "Otherwise you can remove them from your configuration." % varname
-            )
 
 
 def all_nonfunction_vars() -> Set[str]:
@@ -972,9 +958,9 @@ def _host_is_member_of_site(config_cache: "ConfigCache", hostname: HostName, sit
     )
 
 
-def duplicate_hosts() -> List[str]:
+def duplicate_hosts() -> Sequence[HostName]:
     return sorted(
-        hostname  #
+        hostname
         for hostname, count in Counter(
             # This function should only be used during duplicate host check! It has to work like
             # all_active_hosts() but with the difference that duplicates are not removed.
@@ -982,7 +968,7 @@ def duplicate_hosts() -> List[str]:
                 get_config_cache(),
                 strip_tags(list(all_hosts) + list(clusters) + list(_get_shadow_hosts())),
             )
-        ).items()  #
+        ).items()
         if count > 1
     )
 

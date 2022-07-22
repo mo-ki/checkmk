@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import abc
 import argparse
+import collections
 import contextlib
 import enum
 import functools
@@ -26,7 +27,6 @@ import os
 import re
 import sys
 import tempfile
-from collections import defaultdict
 from pathlib import Path
 from typing import (
     Any,
@@ -39,6 +39,7 @@ from typing import (
     List,
     Literal,
     Mapping,
+    MutableMapping,
     NewType,
     Optional,
     Protocol,
@@ -481,10 +482,10 @@ class Pod:
             }
         )
 
-    def start_time(self) -> Optional[api.StartTime]:
+    def start_time(self) -> section.StartTime | None:
         if self.status.start_time is None:
             return None
-        return api.StartTime(start_time=self.status.start_time)
+        return section.StartTime(start_time=self.status.start_time)
 
     def add_controller(self, controller: Union[Deployment, DaemonSet, StatefulSet]) -> None:
         """Add a handling controller of the pod
@@ -800,8 +801,8 @@ class Node(PodOwner):
             allocatable=self.resources["allocatable"].pods,
         )
 
-    def kubelet(self) -> api.KubeletInfo:
-        return self.kubelet_info
+    def kubelet(self) -> section.KubeletInfo:
+        return section.KubeletInfo.parse_obj(self.kubelet_info)
 
     def info(
         self,
@@ -825,17 +826,10 @@ class Node(PodOwner):
         )
 
     def container_count(self) -> section.ContainerCount:
-        result = section.ContainerCount()
-        for pod in self._pods:
-            for container in pod.containers.values():
-                if container.state.type == api.ContainerStateType.running:
-                    result.running += 1
-                elif container.state.type == api.ContainerStateType.waiting:
-                    result.waiting += 1
-                else:
-                    result.terminated += 1
-
-        return result
+        type_count = collections.Counter(
+            container.state.type.name for pod in self._pods for container in pod.containers.values()
+        )
+        return section.ContainerCount(**type_count)
 
     def memory_resources(self) -> section.Resources:
         return _collect_memory_resources(self._pods)
@@ -1158,36 +1152,39 @@ class Cluster:
         return self._cluster_details.version
 
     def node_collector_daemons(self) -> section.CollectorDaemons:
-        collector_daemons = section.CollectorDaemons(
-            machine=None,
-            container=None,
+        # Extract DaemonSets with label key `node-collector`
+        collector_daemons = collections.defaultdict(list)
+        for daemonset in self.daemon_sets():
+            if "node-collector" in daemonset.metadata.labels:
+                collector_type = daemonset.metadata.labels[api.LabelName("node-collector")].value
+                collector_daemons[collector_type].append(daemonset._status)
+        collector_daemons.default_factory = None
+
+        # Only leave unknown collectors inside of `collector_daemons`
+        machine_status = collector_daemons.pop(api.LabelValue("machine-sections"), [])
+        container_status = collector_daemons.pop(api.LabelValue("container-metrics"), [])
+
+        return section.CollectorDaemons(
+            machine=_node_collector_replicas(machine_status),
+            container=_node_collector_replicas(container_status),
             errors=section.IdentificationError(
-                duplicate_machine_collector=False,
-                duplicate_container_collector=False,
-                unknown_collector=False,
+                duplicate_machine_collector=len(machine_status) > 1,
+                duplicate_container_collector=len(container_status) > 1,
+                unknown_collector=len(collector_daemons) > 0,
             ),
         )
-        for daemonset in self.daemon_sets():
-            if labels := daemonset.metadata.labels:
-                if collector_label := labels.get(api.LabelName("node-collector")):
-                    data = section.NodeCollectorReplica(
-                        available=daemonset._status.number_available,
-                        desired=daemonset._status.desired_number_scheduled,
-                    )
-                    if collector_label.value == "machine-sections":
-                        if collector_daemons.machine is None:
-                            collector_daemons.machine = data
-                        else:
-                            collector_daemons.errors.duplicate_machine_collector = True
-                    elif collector_label.value == "container-metrics":
-                        if collector_daemons.container is None:
-                            collector_daemons.container = data
-                        else:
-                            collector_daemons.errors.duplicate_container_collector = True
-                    else:
-                        collector_daemons.errors.unknown_collector = True
 
-        return collector_daemons
+
+def _node_collector_replicas(
+    statuses: list[api.DaemonSetStatus],
+) -> section.NodeCollectorReplica | None:
+    if len(statuses) != 1:
+        return None
+    status = statuses[0]
+    return section.NodeCollectorReplica(
+        available=status.number_available,
+        desired=status.desired_number_scheduled,
+    )
 
 
 # Namespace & Resource Quota specific
@@ -1354,14 +1351,14 @@ def _collect_cpu_resources_from_api_pods(pods: Sequence[api.Pod]) -> section.Res
 
 
 def _pod_resources(pods: Collection[Pod]) -> section.PodResources:
-    resources: DefaultDict[str, List[str]] = defaultdict(list)
+    resources: DefaultDict[str, List[str]] = collections.defaultdict(list)
     for pod in pods:
         resources[pod.phase].append(pod.name())
     return section.PodResources(**resources)
 
 
 def _pod_resources_from_api_pods(pods: Sequence[api.Pod]) -> section.PodResources:
-    resources: DefaultDict[str, List[str]] = defaultdict(list)
+    resources: DefaultDict[str, List[str]] = collections.defaultdict(list)
     for pod in pods:
         resources[pod.status.phase].append(pod_name(pod))
     return section.PodResources(**resources)
@@ -1425,12 +1422,7 @@ def namespace_name(namespace: api.Namespace) -> api.NamespaceName:
     return namespace.metadata.name
 
 
-class JsonProtocol(Protocol):
-    def json(self) -> str:
-        ...
-
-
-def _write_sections(sections: Mapping[str, Callable[[], Optional[JsonProtocol]]]) -> None:
+def _write_sections(sections: Mapping[str, Callable[[], section.Section | None]]) -> None:
     for section_name, section_call in sections.items():
         if section_output := section_call():
             with SectionWriter(section_name) as writer:
@@ -1482,10 +1474,14 @@ def write_namespaces_api_sections(
 
     def output_resource_quota_sections(resource_quota: api.ResourceQuota) -> None:
         sections = {
-            "kube_resource_quota_memory_resources_v1": lambda: resource_quota.spec.hard.memory
+            "kube_resource_quota_memory_resources_v1": lambda: section.HardResourceRequirement.parse_obj(
+                resource_quota.spec.hard.memory
+            )
             if resource_quota.spec.hard
             else None,
-            "kube_resource_quota_cpu_resources_v1": lambda: resource_quota.spec.hard.cpu
+            "kube_resource_quota_cpu_resources_v1": lambda: section.HardResourceRequirement.parse_obj(
+                resource_quota.spec.hard.cpu
+            )
             if resource_quota.spec.hard
             else None,
         }
@@ -1650,7 +1646,7 @@ def pod_api_based_checkmk_sections(
     cluster_name: str,
     annotation_key_pattern: AnnotationOption,
     pod: Pod,
-) -> Iterable[tuple[str, BaseModel | None]]:  # TODO: improve this type
+) -> Iterable[tuple[str, section.Section | None]]:
     sections = (
         ("kube_pod_conditions_v1", pod.conditions),
         ("kube_pod_containers_v1", pod.container_statuses),
@@ -1709,21 +1705,21 @@ def filter_outdated_and_non_monitored_pods(
 def _write_object_sections(containers: Collection[PerformanceContainer]) -> None:
     # Memory section
     with SectionWriter("kube_performance_memory_v1") as writer:
-        section_json = section.PerformanceUsage(
+        memory_section: section.Section = section.PerformanceUsage(
             resource=section.Memory(
                 usage=_aggregate_metric(containers, MetricName("memory_working_set_bytes"))
             ),
-        ).json()
-        writer.append(section_json)
+        )
+        writer.append(memory_section.json())
 
     # CPU section
     with SectionWriter("kube_performance_cpu_v1") as writer:
-        section_json = section.PerformanceUsage(
+        cpu_section: section.Section = section.PerformanceUsage(
             resource=section.Cpu(
                 usage=_aggregate_rate_metric(containers, MetricName("cpu_usage_seconds_total")),
             ),
-        ).json()
-        writer.append(section_json)
+        )
+        writer.append(cpu_section.json())
 
 
 def filter_associating_performance_pods_from_agent_pods(
@@ -1983,7 +1979,7 @@ def make_api_client(arguments: argparse.Namespace) -> client.ApiClient:
     with requests.Session() as session:
         req = requests.models.Request(method="GET", url=host, data={}, params={})
         prep = session.prepare_request(req)
-        proxies = http_proxy_config.to_requests_proxies() or {}
+        proxies: MutableMapping = dict(http_proxy_config.to_requests_proxies() or {})
         proxies = session.merge_environment_settings(
             prep.url, proxies, session.stream, session.verify, session.cert
         )["proxies"]
@@ -2112,7 +2108,9 @@ def group_metrics_by_container(
     if omit_metrics is None:
         omit_metrics = []
 
-    containers: DefaultDict[ContainerName, Dict[MetricName, PerformanceMetric]] = defaultdict(dict)
+    containers: DefaultDict[
+        ContainerName, Dict[MetricName, PerformanceMetric]
+    ] = collections.defaultdict(dict)
     for performance_metric in performance_metrics:
         if performance_metric.name in omit_metrics:
             continue

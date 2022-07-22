@@ -6,6 +6,7 @@
 import socket
 import time
 from contextlib import suppress
+from functools import partial
 from pathlib import Path
 from typing import (
     Callable,
@@ -551,13 +552,32 @@ def active_check_discovery(
     *,
     fetched: Sequence[Tuple[Source, FetcherMessage]],
 ) -> ServiceState:
-    return _execute_check_discovery_with_error_handling(host_name, fetched=fetched)
+    host_config = HostConfig.make_host_config(host_name)
+    return error_handling.check_result(
+        partial(_execute_check_discovery, host_name, fetched=fetched),
+        host_config=host_config,
+        service_name="Check_MK Discovery",
+        plugin_name="discover",
+    )
 
 
 def commandline_check_discovery(
     host_name: HostName,
     ipaddress: Optional[HostAddress],
 ) -> ServiceState:
+    host_config = HostConfig.make_host_config(host_name)
+    return error_handling.check_result(
+        partial(_commandline_check_discovery, host_name, ipaddress),
+        host_config=host_config,
+        service_name="Check_MK Discovery",
+        plugin_name="discover",
+    )
+
+
+def _commandline_check_discovery(
+    host_name: HostName,
+    ipaddress: Optional[HostAddress],
+) -> ActiveCheckResult:
     config_cache = config.get_config_cache()
     host_config = config_cache.get_host_config(host_name)
 
@@ -589,29 +609,7 @@ def commandline_check_discovery(
         mode=Mode.DISCOVERY,
     )
 
-    return _execute_check_discovery_with_error_handling(host_name, fetched=fetched)
-
-
-def _execute_check_discovery_with_error_handling(
-    host_name: HostName,
-    *,
-    fetched: Sequence[Tuple[Source, FetcherMessage]],
-) -> ServiceState:
-    host_config = HostConfig.make_host_config(host_name)
-    try:
-        state, text = error_handling.handle_success(
-            _execute_check_discovery(host_name, fetched=fetched)
-        )
-    except Exception as exc:
-        state, text = error_handling.handle_failure(
-            exc,
-            host_config.exit_code_spec(),
-            host_config=host_config,
-            service_name="Check_MK Discovery",
-            plugin_name="discover",
-        )
-    error_handling.handle_output(text, host_name)
-    return state
+    return _execute_check_discovery(host_name, fetched=fetched)
 
 
 def _execute_check_discovery(
@@ -906,9 +904,17 @@ def discover_marked_hosts(
             cmk.core_helpers.cache.FileCacheFactory.use_outdated = False
             cmk.core_helpers.cache.FileCacheFactory.maybe = True
             if config.monitoring_core == "cmc":
-                cmk.base.core.do_reload(core)
+                cmk.base.core.do_reload(
+                    core,
+                    locking_mode=config.restart_locking,
+                    duplicates=config.duplicate_hosts(),
+                )
             else:
-                cmk.base.core.do_restart(core)
+                cmk.base.core.do_restart(
+                    core,
+                    locking_mode=config.restart_locking,
+                    duplicates=config.duplicate_hosts(),
+                )
         finally:
             _config_cache.clear_all()
             config.get_config_cache().initialize()

@@ -3,9 +3,14 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
+# pylint: disable=redefined-outer-name
+from dataclasses import dataclass
+from typing import Callable
+
 import pytest
 
 import cmk.utils.rulesets.ruleset_matcher as ruleset_matcher
+from cmk.utils import version
 from cmk.utils.type_defs import RuleOptions, RuleOptionsSpec, RuleSpec
 
 import cmk.gui.utils
@@ -565,3 +570,167 @@ def test_rule_clone(request_context) -> None:
     assert rule.folder == cloned_rule.folder
     assert rule.ruleset == cloned_rule.ruleset
     assert rule.id != cloned_rule.id
+
+
+@pytest.mark.parametrize(
+    "search_options, rule_config, folder_name, expected_result",
+    [
+        (
+            {"rule_host_list": "foobar123"},
+            {
+                "id": "2a983a0a-7fab-4403-ab9d-5922fd8be529",
+                "value": "all",
+                "condition": {
+                    "host_name": [{"$regex": ".*foo.*"}],
+                },
+                "options": {"disabled": False, "description": "foo"},
+            },
+            "regex_check",
+            True,
+        ),
+        (
+            {"rule_host_list": "foobar123"},
+            {
+                "id": "efd67dab-68f8-4d3c-a417-9f7e29ab48d5",
+                "value": "all",
+                "condition": {},
+                "options": {"description": 'Put all hosts into the contact group "all"'},
+            },
+            "",
+            True,
+        ),
+        (
+            {"rule_host_list": "foobar123"},
+            {
+                "id": "59d84cde-ee3a-4f8d-8bec-fce35a2b0d15",
+                "value": "all",
+                "condition": {
+                    "host_name": ["foobar123"],
+                },
+                "options": {"description": "foo"},
+            },
+            "regex_check",
+            True,
+        ),
+        (
+            {"rule_host_list": "foobar123"},
+            {
+                "id": "e10843c55-11ea-4eb2-bfbc-bce65cd2ae22",
+                "value": "all",
+                "condition": {
+                    "host_name": [{"$regex": ".*foo123.*"}],
+                },
+                "options": {"description": "foo"},
+            },
+            "regex_check",
+            False,
+        ),
+    ],
+)
+def test_matches_search_with_rules(
+    with_admin_login,
+    search_options: rulesets.SearchOptions,
+    rule_config: RuleSpec,
+    folder_name: str,
+    expected_result: bool,
+):
+    hosts_and_folders.Folder.create_missing_folders(folder_name)
+    folder = hosts_and_folders.Folder.folder(folder_name)
+    ruleset = _ruleset("host_contactgroups")
+    rule = rulesets.Rule.from_config(folder, ruleset, rule_config)
+    ruleset.append_rule(folder, rule)
+
+    assert ruleset.matches_search_with_rules(search_options) == expected_result
+
+
+@dataclass
+class _RuleHelper:
+    """Helps making and accessing rules"""
+
+    rule: Callable[[], rulesets.Rule]
+    secret_attr: str
+    new_secret: object
+    other_attr: str
+
+    @staticmethod
+    def _make_rule(ruleset: str, value: dict) -> rulesets.Rule:
+        return rulesets.Rule.from_config(
+            hosts_and_folders.Folder.root_folder(),
+            _ruleset(ruleset),
+            {"id": "1", "value": value, "condition": {"host_name": ["HOSTLIST"]}},
+        )
+
+    @staticmethod
+    def gcp_rule() -> rulesets.Rule:
+        return _RuleHelper._make_rule(
+            "special_agents:gcp",
+            {
+                "project": "old_value",
+                "credentials": ("password", "hunter2"),
+                "services": ["gcs", "gce"],
+            },
+        )
+
+    @staticmethod
+    def ssh_rule() -> rulesets.Rule:
+        return _RuleHelper._make_rule(
+            "agent_config:lnx_remote_alert_handlers",
+            {"handlers": {}, "runas": "old_value", "sshkey": ("private_key", "public_key")},
+        )
+
+
+@pytest.fixture(
+    params=[
+        _RuleHelper(_RuleHelper.gcp_rule, "credentials", ("password", "geheim"), "project"),
+        pytest.param(
+            _RuleHelper(_RuleHelper.ssh_rule, "sshkey", ("new_priv", "public_key"), "runas"),
+            marks=pytest.mark.skipif(
+                version.is_raw_edition(),
+                reason="lnx_remote_alert_handlers is not available in raw edition",
+            ),
+        ),
+    ]
+)
+def rule_helper(request) -> _RuleHelper:
+    return request.param
+
+
+def test_to_log_masks_secrets(request_context) -> None:
+    log = str(_RuleHelper.gcp_rule().to_log())
+    assert "'password'" in log, "password tuple is present"
+    assert "hunter2" not in log, "password is masked"
+
+
+def test_diff_rules_new_rule(request_context, rule_helper) -> None:
+    new = rule_helper.rule()
+    diff = new.ruleset.diff_rules(None, new)
+    assert rule_helper.secret_attr in diff, "Attribute is added in new rule"
+    assert "******" in diff, "Attribute is masked"
+
+
+def test_diff_to_no_changes(request_context, rule_helper) -> None:
+    rule = rule_helper.rule()
+    assert rule.diff_to(rule) == "Nothing was changed."
+
+
+def test_diff_to_secret_changed(request_context, rule_helper) -> None:
+    old, new = rule_helper.rule(), rule_helper.rule()
+    new.value[rule_helper.secret_attr] = rule_helper.new_secret
+    assert old.diff_to(new) == "Redacted secrets changed."
+
+
+def test_diff_to_secret_unchanged(request_context, rule_helper) -> None:
+    old, new = rule_helper.rule(), rule_helper.rule()
+    new.value[rule_helper.other_attr] = "new_value"
+    diff = old.diff_to(new)
+    assert "Redacted secrets changed." not in diff
+    assert 'changed from "old_value" to "new_value".' in diff
+
+
+def test_diff_to_secret_and_other_attribute_changed(request_context, rule_helper) -> None:
+    old, new = rule_helper.rule(), rule_helper.rule()
+    new.value[rule_helper.secret_attr] = rule_helper.new_secret
+    new.value[rule_helper.other_attr] = "new_value"
+    diff = old.diff_to(new)
+    assert "Redacted secrets changed." in diff
+    assert 'changed from "old_value" to "new_value".' in diff

@@ -11,6 +11,8 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 from ..agent_based_api.v1 import check_levels, check_levels_predictive, Result, Service, State
 from ..agent_based_api.v1.type_defs import CheckResult, DiscoveryResult, StringTable
 
+Project = str
+
 
 @dataclass(frozen=True)
 class GCPResult:
@@ -79,7 +81,6 @@ Section = Mapping[str, SectionItem]
 PiggyBackSection = Sequence[GCPResult]
 AssetType = str
 Item = str
-Project = str
 AssetTypeSection = Mapping[Item, GCPAsset]
 
 
@@ -91,6 +92,9 @@ class AssetSection:
 
     def __getitem__(self, key: AssetType) -> AssetTypeSection:
         return self._assets[key]
+
+    def __contains__(self, key: AssetType) -> bool:
+        return key in self._assets
 
 
 def parse_gcp(
@@ -217,13 +221,14 @@ def service_name_factory(gcp_service: str) -> ServiceNamer:
     return ServiceNamer(gcp_service)
 
 
-def discovery_summary(section: AssetSection) -> DiscoveryResult:
-    yield Service()
+def discovery_summary(section: AssetSection, service: str) -> DiscoveryResult:
+    if section.config.is_enabled(service):
+        yield Service()
 
 
 def check_summary(asset_type: str, descriptor: str, section: AssetSection) -> CheckResult:
-    n = len(section[asset_type])
-    appendix = "s" if n > 1 else ""
+    n = len(section[asset_type]) if asset_type in section else 0
+    appendix = "s" if n != 1 else ""
     yield Result(
         state=State.OK,
         summary=f"{n} {descriptor}{appendix}",

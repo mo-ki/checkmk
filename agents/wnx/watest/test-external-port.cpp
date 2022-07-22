@@ -5,6 +5,7 @@
 #include "pch.h"
 
 #include <chrono>
+#include <numeric>
 
 #include "agent_controller.h"
 #include "asio.h"
@@ -12,6 +13,7 @@
 #include "test_tools.h"
 
 using namespace std::chrono_literals;
+using namespace std::string_literals;
 using asio::ip::tcp;
 
 namespace wtools {  // to become friendly for wtools classes
@@ -47,18 +49,21 @@ TEST(ExternalPortTest, StartStop) {
     wtools::TestProcessor2 tp;
     world::ExternalPort test_port(&tp);  //
 
-    EXPECT_TRUE(
-        test_port.startIo(reply, tst::TestPort(), world::LocalOnly::yes, {}));
-    EXPECT_TRUE(test_port.io_thread_.joinable());
-    EXPECT_FALSE(
-        test_port.startIo(reply, tst::TestPort(), world::LocalOnly::yes, {}));
+    ExternalPort::IoParam io_param{
+        .port{tst::TestPort()},
+        .local_only{LocalOnly::yes},
+        .pid{},
+    };
+    EXPECT_TRUE(test_port.startIo(reply, io_param));
+    EXPECT_TRUE(test_port.isIoStarted());
+    EXPECT_FALSE(test_port.startIo(reply, io_param));
 
     EXPECT_TRUE(tst::WaitForSuccessSilent(
-        1000ms, [&test_port]() { return test_port.io_thread_.joinable(); }));
+        1000ms, [&test_port]() { return test_port.isIoStarted(); }));
 
     cma::tools::sleep(50);
     test_port.shutdownIo();  // this is long operation
-    EXPECT_TRUE(!test_port.io_thread_.joinable());
+    EXPECT_FALSE(test_port.isIoStarted());
 }
 
 class ExternalPortCheckProcessFixture : public ::testing::Test {
@@ -92,9 +97,18 @@ public:
     }
 };
 
+namespace {
+ExternalPort::IoParam makeIoParam(std::optional<uint32_t> pid) {
+    return {
+        .port{tst::TestPort()},
+        .local_only{LocalOnly::yes},
+        .pid{pid},
+    };
+}
+}  // namespace
+
 TEST_F(ExternalPortCheckProcessFixture, AnyProcess) {
-    EXPECT_TRUE(
-        test_port.startIo(reply, tst::TestPort(), world::LocalOnly::yes, {}));
+    EXPECT_TRUE(test_port.startIo(reply, makeIoParam({})));
 
     EXPECT_EQ(writeToSocket(tst::TestPort()), 6U);
     tst::WaitForSuccessSilent(100ms, [this]() { return !remote_ip.empty(); });
@@ -103,7 +117,7 @@ TEST_F(ExternalPortCheckProcessFixture, AnyProcess) {
 }
 
 TEST_F(ExternalPortCheckProcessFixture, InvalidProcess) {
-    EXPECT_TRUE(test_port.startIo(reply, tst::TestPort(), LocalOnly::yes, 1));
+    EXPECT_TRUE(test_port.startIo(reply, makeIoParam(1)));
 
     EXPECT_EQ(writeToSocket(tst::TestPort()), 6U);
     std::this_thread::sleep_for(300ms);
@@ -112,8 +126,7 @@ TEST_F(ExternalPortCheckProcessFixture, InvalidProcess) {
 }
 
 TEST_F(ExternalPortCheckProcessFixture, ValidProcess) {
-    EXPECT_TRUE(test_port.startIo(reply, tst::TestPort(), LocalOnly::yes,
-                                  ::GetCurrentProcessId()));
+    EXPECT_TRUE(test_port.startIo(reply, makeIoParam(::GetCurrentProcessId())));
 
     EXPECT_EQ(writeToSocket(tst::TestPort()), 6U);
     tst::WaitForSuccessSilent(100ms, [this]() { return !remote_ip.empty(); });
@@ -132,8 +145,9 @@ public:
         return data;
     };
     void SetUp() override {
-        test_port_.startIo(reply, tst::TestPort(), world::LocalOnly::no,
-                           {});  //
+        test_port_.startIo(
+            reply,
+            {.port{tst::TestPort()}, .local_only{LocalOnly::no}, .pid{}});
     }
 
     void TearDown() override {
@@ -176,75 +190,64 @@ TEST_F(ExternalPortTestFixture, ReadIntegration) {
     EXPECT_EQ(reply_text_, text);
 }
 
-TEST(ExternalPortTest, LowLevelApiBase) {
-    asio::io_context io;
-
-    ExternalPort test_port(nullptr);
-    std::vector<AsioSession::s_ptr> a;
-    for (int i = 0; i < 32; i++) {
-        asio::ip::tcp::socket s(io);
-        a.emplace_back(std::make_shared<AsioSession>(std::move(s)));
-    }
-
-    EXPECT_EQ(test_port.session_queue_.size(), 0);
-
-    for (auto as : a) {
-        test_port.putOnQueue(as);
-    }
-    EXPECT_TRUE(test_port.session_queue_.size() ==
-                test_port.kMaxSessionQueueLength);
-
-    int count = 0;
-
-    ASSERT_TRUE(tst::WaitForSuccessSilent(1000ms, [&count, &test_port]() {
-        while (!test_port.session_queue_.empty()) {
-            if (test_port.getSession()) {
-                ++count;
-            }
+class ExternalPortQueueFixture : public ::testing::Test {
+public:
+    void TearDown() override { test_port_.shutdownIo(); }
+    void putSessionsInPort() {
+        for (int i = 0; i < 32; i++) {
+            asio::ip::tcp::socket s(io_);
+            sessions_.emplace_back(std::make_shared<AsioSession>(std::move(s)));
         }
 
-        return count == test_port.kMaxSessionQueueLength;
-    }));
+        for (auto as : sessions_) {
+            test_port_.putOnQueue(as);
+        }
+    }
+    void putRequestsInPort() {
+        std::array<std::string, kMaxSessionQueueLength * 2U> commands;
+        int cur = 0;
+        std::ranges::generate(
+            commands, [&cur] { return fmt::format("{} comment", cur++); });
+        for (const auto &c : commands) {
+            test_port_.putOnQueue(c);
+        }
+    }
+    ExternalPort test_port_{nullptr};
+    asio::io_context io_;
+    std::vector<AsioSession::s_ptr> sessions_;
+    std::vector<std::string> result_;
+};
 
-    auto as = test_port.getSession();
-    EXPECT_TRUE(!as);
+TEST_F(ExternalPortQueueFixture, FillAndConsumeAsioSessions) {
+    EXPECT_EQ(test_port_.entriesInQueue(), 0);
+    putSessionsInPort();
+    EXPECT_EQ(test_port_.entriesInQueue(), kMaxSessionQueueLength);
+
+    test_port_.startIoTcpPort(
+        [](const std::string & /*_*/) { return std::vector<uint8_t>{}; },
+        10000);
+    EXPECT_TRUE(tst::WaitForSuccessSilent(
+        1000ms, [this]() { return test_port_.entriesInQueue() == 0; }));
 }
 
-TEST(ExternalPortTest, ProcessQueue) {
-    asio::io_context io;
+TEST_F(ExternalPortQueueFixture, FillAndConsumeMailSlotRequests) {
+    putRequestsInPort();
+    EXPECT_EQ(test_port_.entriesInQueue(), kMaxSessionQueueLength);
 
-    ExternalPort test_port(nullptr);
-    std::vector<AsioSession::s_ptr> a;
-    ReplyFunc reply =
-        [&test_port](const std::string /*ip*/) -> std::vector<uint8_t> {
-        return {};
-    };
-
-    constexpr size_t max_count = 8;
-    for (size_t i = 0; i < max_count; i++) {
-        asio::ip::tcp::socket s(io);
-        EXPECT_NO_THROW(GetSocketInfo(s));
-        a.emplace_back(std::make_shared<AsioSession>(std::move(s)));
-    }
-
-    {
-        EXPECT_EQ(test_port.sessionsInQueue(), 0);
-
-        for (auto as : a) {
-            test_port.putOnQueue(as);
-        }
-        EXPECT_EQ(test_port.sessionsInQueue(), 8);
-
-        auto f = std::async(std::launch::async, &ExternalPort::processQueue,
-                            &test_port, reply);
-
-        tst::WaitForSuccessSilent(1000ms, [&test_port]() {
-            return test_port.sessionsInQueue() == 0;
+    test_port_.startIo(
+        [this](const std::string &r) {
+            result_.emplace_back(r);
+            return std::vector<uint8_t>{};
+        },
+        ExternalPort::IoParam{
+            .port{0},
+            .local_only{LocalOnly::no},
+            .pid{::GetCurrentProcessId()},
         });
-
-        EXPECT_EQ(test_port.sessionsInQueue(), 0);
-        test_port.shutdownIo();
-    }
+    EXPECT_TRUE(tst::WaitForSuccessSilent(
+        1000ms, [this]() { return test_port_.entriesInQueue() == 0; }));
+    EXPECT_EQ(std::accumulate(result_.begin(), result_.end(), ""s),
+              "0123456789101112131415"s);
 }
 
 namespace {

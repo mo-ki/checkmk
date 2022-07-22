@@ -8,6 +8,7 @@ while the inventory is performed for one host.
 In the future all inventory code should be moved to this module."""
 
 import time
+from functools import partial
 from pathlib import Path
 from typing import Container, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
@@ -129,20 +130,12 @@ def _commandline_inventory_on_host(
 
 def active_check_inventory(hostname: HostName, options: Dict[str, int]) -> ServiceState:
     host_config = HostConfig.make_host_config(hostname)
-    try:
-        state, text = error_handling.handle_success(
-            _execute_active_check_inventory(hostname, options)
-        )
-    except Exception as exc:
-        state, text = error_handling.handle_failure(
-            exc,
-            host_config.exit_code_spec(),
-            host_config=host_config,
-            plugin_name="check_mk_active-cmk_inv",
-            service_name="Check_MK HW/SW Inventory",
-        )
-    error_handling.handle_output(text, hostname)
-    return state
+    return error_handling.check_result(
+        partial(_execute_active_check_inventory, hostname, options),
+        host_config=host_config,
+        plugin_name="check_mk_active-cmk_inv",
+        service_name="Check_MK HW/SW Inventory",
+    )
 
 
 def _execute_active_check_inventory(

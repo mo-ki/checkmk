@@ -384,7 +384,11 @@ class AutomationRenameHosts(Automation):
         # it now.
         core_was_running = self._core_is_running()
         if core_was_running:
-            cmk.base.core.do_core_action(CoreAction.STOP, quiet=True)
+            cmk.base.core.do_core_action(
+                CoreAction.STOP,
+                quiet=True,
+                monitoring_core=config.monitoring_core,
+            )
 
         try:
             for oldname, newname in renamings:
@@ -671,6 +675,23 @@ s/(HOST|SERVICE) NOTIFICATION: ([^;]+);%(old)s;/\1 NOTIFICATION: \2;%(new)s;/
 
 
 automations.register(AutomationRenameHosts())
+
+
+class AutomationGetServicesLabels(Automation):
+    cmd = "get-services-labels"
+    needs_config = True
+    needs_checks = True
+
+    def execute(self, args: List[str]) -> automation_results.GetServicesLabelsResult:
+        hostname, services = HostName(args[0]), args[1:]
+        config_cache = config.get_config_cache()
+
+        return automation_results.GetServicesLabelsResult(
+            {service: config_cache.labels_of_service(hostname, service) for service in services}
+        )
+
+
+automations.register(AutomationGetServicesLabels())
 
 
 class AutomationAnalyseServices(Automation):
@@ -1001,6 +1022,8 @@ class AutomationRestart(Automation):
                     create_core(config.monitoring_core),
                     self._mode(),
                     hosts_to_update=None if not args else set(args),
+                    locking_mode=config.restart_locking,
+                    duplicates=config.duplicate_hosts(),
                 )
             except (MKBailOut, MKGeneralException) as e:
                 raise MKAutomationError(str(e))

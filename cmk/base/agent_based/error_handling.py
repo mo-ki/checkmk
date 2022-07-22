@@ -3,7 +3,7 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 
-from typing import Tuple
+from typing import Callable, Tuple
 
 import cmk.utils.debug
 import cmk.utils.version as cmk_version
@@ -24,7 +24,28 @@ import cmk.base.obsolete_output as out
 from cmk.base.config import HostConfig
 
 
-def handle_success(result: ActiveCheckResult) -> Tuple[ServiceState, str]:
+def check_result(
+    callback: Callable[[], ActiveCheckResult],
+    *,
+    host_config: HostConfig,
+    service_name: ServiceName,
+    plugin_name: CheckPluginNameStr,
+) -> ServiceState:
+    try:
+        state, text = _handle_success(callback())
+    except Exception as exc:
+        state, text = _handle_failure(
+            exc,
+            host_config.exit_code_spec(),
+            host_config=host_config,
+            service_name=service_name,
+            plugin_name=plugin_name,
+        )
+    _handle_output(text, host_config.hostname)
+    return state
+
+
+def _handle_success(result: ActiveCheckResult) -> Tuple[ServiceState, str]:
     return result.state, "\n".join(
         (
             " | ".join((result.summary, " ".join(result.metrics))),
@@ -33,7 +54,7 @@ def handle_success(result: ActiveCheckResult) -> Tuple[ServiceState, str]:
     )
 
 
-def handle_failure(
+def _handle_failure(
     exc: Exception,
     exit_spec: ExitSpec,
     *,
@@ -66,7 +87,7 @@ def handle_failure(
     )
 
 
-def handle_output(output_text: str, hostname: HostName) -> None:
+def _handle_output(output_text: str, hostname: HostName) -> None:
     if _in_keepalive_mode():
         import cmk.base.cee.keepalive as keepalive  # pylint: disable=no-name-in-module
 

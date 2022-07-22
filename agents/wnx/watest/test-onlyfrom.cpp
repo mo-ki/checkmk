@@ -205,8 +205,9 @@ TEST(OnlyFromTest, LocalAllowedIpv6) {
 
     ip_received.clear();
     world::ExternalPort test_port(nullptr);
-    ASSERT_TRUE(test_port.startIo(RegisterIp, tst::TestPort(),
-                                  world::LocalOnly::no, {}));
+    ASSERT_TRUE(test_port.startIo(
+        RegisterIp,
+        {.port{tst::TestPort()}, .local_only{world::LocalOnly::no}, .pid{}}));
     WriteToSocket("::1");
     EXPECT_EQ(ip_received, "::1");
     test_port.shutdownIo();
@@ -222,7 +223,7 @@ TEST(OnlyFromTest, LocalAllowed) {
 
     ip_received.clear();
     world::ExternalPort test_port(nullptr);
-    ASSERT_TRUE(test_port.startIo(RegisterIp, tst::TestPort()));
+    ASSERT_TRUE(test_port.startIoTcpPort(RegisterIp, tst::TestPort()));
     WriteToSocket("127.0.0.1");
     EXPECT_EQ(ip_received, "127.0.0.1");
     test_port.shutdownIo();
@@ -240,7 +241,7 @@ TEST(OnlyFromTest, LocalForbidden) {
 
     ip_received.clear();
     cma::world::ExternalPort test_port(nullptr);
-    ASSERT_TRUE(test_port.startIo(RegisterIp, tst::TestPort()));
+    ASSERT_TRUE(test_port.startIoTcpPort(RegisterIp, tst::TestPort()));
     WriteToSocket("::1");  // forbidden address
     EXPECT_EQ(ip_received, "Forbidden");
     test_port.shutdownIo();
@@ -259,7 +260,7 @@ TEST(OnlyFromTest, AllowedIpv6) {
 
     ip_received.clear();
     cma::world::ExternalPort test_port(nullptr);
-    ASSERT_TRUE(test_port.startIo(RegisterIp, tst::TestPort()));
+    ASSERT_TRUE(test_port.startIoTcpPort(RegisterIp, tst::TestPort()));
     WriteToSocket("::1");
 
     EXPECT_EQ(ip_received, "::1");
@@ -301,8 +302,8 @@ TEST(OnlyFromTest, Ipv6Integration) {
     using namespace asio;
     // ipv4
     {
-        cma::world::ExternalPort test_port(nullptr);           //
-        auto ret = test_port.startIo(reply, tst::TestPort());  //
+        cma::world::ExternalPort test_port(nullptr);                  //
+        auto ret = test_port.startIoTcpPort(reply, tst::TestPort());  //
         ASSERT_TRUE(ret);
 
         try {
@@ -328,8 +329,8 @@ TEST(OnlyFromTest, Ipv6Integration) {
 
     // ipv6 connect
     {
-        cma::world::ExternalPort test_port(nullptr);           //
-        auto ret = test_port.startIo(reply, tst::TestPort());  //
+        cma::world::ExternalPort test_port(nullptr);                  //
+        auto ret = test_port.startIoTcpPort(reply, tst::TestPort());  //
         ASSERT_TRUE(ret);
         io_context ios;
         ip::tcp::endpoint endpoint(ip::make_address("::1"), tst::TestPort());
@@ -358,8 +359,8 @@ TEST(OnlyFromTest, Ipv6Integration) {
 
         //  ipv6 no connect
         {
-            cma::world::ExternalPort test_port(nullptr);           //
-            auto ret = test_port.startIo(reply, tst::TestPort());  //
+            cma::world::ExternalPort test_port(nullptr);                  //
+            auto ret = test_port.startIoTcpPort(reply, tst::TestPort());  //
             ASSERT_TRUE(ret);
             io_context ios;
             ip::tcp::endpoint endpoint(ip::make_address("::1"),
@@ -379,8 +380,8 @@ TEST(OnlyFromTest, Ipv6Integration) {
 
         //  ipv4 connected successfully
         {
-            cma::world::ExternalPort test_port(nullptr);           //
-            auto ret = test_port.startIo(reply, tst::TestPort());  //
+            cma::world::ExternalPort test_port(nullptr);                  //
+            auto ret = test_port.startIoTcpPort(reply, tst::TestPort());  //
             ASSERT_TRUE(ret);
             io_context ios;
             ip::tcp::endpoint endpoint(ip::make_address("127.0.0.1"),
